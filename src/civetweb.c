@@ -2973,7 +2973,8 @@ static int push(struct mg_context *ctx,
 		}
 		if (n < 0) {
 			/* socket error - check errno */
-			DEBUG_TRACE("send() failed, error %d", ERRNO);
+			int err = ERRNO;
+			DEBUG_TRACE("send() failed, error %d", err);
 			return -1;
 		}
 		if (timeout > 0) {
@@ -3066,8 +3067,33 @@ pull(FILE *fp, struct mg_connection *conn, char *buf, int len, double timeout)
 		}
 		if (nread < 0) {
 			/* socket error - check errno */
-			DEBUG_TRACE("recv() failed, error %d", ERRNO);
-			return -1;
+			int err = ERRNO;
+#ifdef _WIN32
+			if (err == WSAEWOULDBLOCK) {
+				/* standard case if called from close_socket_gracefully */
+				return -1;
+			} else if (err == WSAETIMEDOUT) {
+				/* timeout is handled by the while loop  */
+			} else {
+				DEBUG_TRACE("recv() failed, error %d", err);
+				return -1;
+			}
+#else
+			/* TODO: POSIX returns either EAGAIN or EWOULDBLOCK in both cases,
+			 * if the timeout is reached and if the socket was set to non-
+			 * blocking in close_socket_gracefully, so we can not distinguish
+			 * here. We have to wait for the timeout in both cases for now.
+			 */
+			if (err == EAGAIN || err == EWOULDBLOCK) {
+				/* standard case if called from close_socket_gracefully
+				 * => should return -1 */
+				/* or timeout occured
+				 * => the code must stay in the while loop */
+			} else {
+				DEBUG_TRACE("recv() failed, error %d", err);
+				return -1;
+			}
+#endif
 		}
 		if (timeout > 0) {
 			clock_gettime(CLOCK_MONOTONIC, &now);
@@ -5106,9 +5132,11 @@ static void send_file_data(struct mg_connection *conn,
 	int to_read, num_read, num_written;
 	int64_t size;
 
-	/* Sanity check the offset */
-	if (!filep)
+	if (!filep || !conn) {
 		return;
+	}
+
+	/* Sanity check the offset */
 	size = filep->size > INT64_MAX ? INT64_MAX : (int64_t)(filep->size);
 	offset = offset < 0 ? 0 : offset > size ? size : offset;
 
@@ -5141,8 +5169,6 @@ static void send_file_data(struct mg_connection *conn,
 			}
 
 			/* Both read and were successful, adjust counters */
-			if (!conn)
-				break;
 			conn->num_bytes_sent += num_written;
 			len -= num_written;
 		}
@@ -8791,13 +8817,9 @@ static void close_socket_gracefully(struct mg_connection *conn)
 	int n;
 #endif
 	struct linger linger;
-	double timeout = -1.0;
 
 	if (!conn) {
 		return;
-	}
-	if (conn->ctx->config[REQUEST_TIMEOUT]) {
-		timeout = atoi(conn->ctx->config[REQUEST_TIMEOUT]) / 1000.0;
 	}
 
 	/* Set linger option to avoid socket hanging out after close. This prevent
@@ -8827,7 +8849,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 	 * when server decides to close the connection; then when client
 	 * does recv() it gets no data back. */
 	do {
-		n = pull(NULL, conn, buf, sizeof(buf), timeout);
+		n = pull(NULL, conn, buf, sizeof(buf), 1E-10 /* TODO: allow 0 as timeout */);
 	} while (n > 0);
 #endif
 
